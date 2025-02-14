@@ -1,0 +1,314 @@
+import os
+import requests
+import numpy as np
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from rasterio.merge import merge
+from rasterio.warp import reproject, Resampling
+from rasterio.transform import from_origin
+from pystac_client import Client
+import planetary_computer
+import srtm
+import matplotlib.colors as mcolors
+from affine import Affine
+
+# Set your desired directory as the current working directory
+os.chdir(r"Path to your working directory")
+
+
+# ----------------------------------------------------------------------------
+# Set the output directory
+# ----------------------------------------------------------------------------
+OUTPUT_DIR = r"Path to your directory"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Configure rasterio to disable disk space check
+os.environ['GDAL_CHECK_DISK_FREE_SPACE'] = 'FALSE'
+
+# ----------------------------------------------------------------------------
+# Step 1: Load the Punjab Shapefile
+# ----------------------------------------------------------------------------
+punjab_shp_path = r"Path to your working directory\Punjab.shp"
+punjab_gdf = gpd.read_file(punjab_shp_path)
+
+print("Punjab GeoDataFrame head:")
+print(punjab_gdf.head())
+print("CRS of the shapefile:", punjab_gdf.crs)
+
+punjab_bounds = punjab_gdf.total_bounds
+print("Punjab Bounding Box:", punjab_bounds)
+
+# ----------------------------------------------------------------------------
+# Step 2: Query ESA Land Cover Data
+# ----------------------------------------------------------------------------
+stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
+client = Client.open(stac_url)
+
+search = client.search(
+    collections=["esa-worldcover"],
+    bbox=punjab_bounds.tolist(),
+    datetime="2021-01-01T00:00:00Z/2021-12-31T23:59:59Z"
+)
+
+items = list(search.items())
+print(f"Found {len(items)} items for Punjab.")
+
+if len(items) == 0:
+    raise ValueError("No ESA WorldCover items found for the specified region and date range.")
+
+# ----------------------------------------------------------------------------
+# Step 3: Download ALL ESA Land Cover Items
+# ----------------------------------------------------------------------------
+downloaded_files = []
+
+for i, it in enumerate(items):
+    signed_item = planetary_computer.sign(it)
+    asset = signed_item.assets["map"]
+    map_url = asset.href
+    
+    local_tif = os.path.join(OUTPUT_DIR, f"ESA_WorldCover_10m_2021_{signed_item.id}.tif")
+    
+    if not os.path.exists(local_tif):
+        response = requests.get(map_url, stream=True)
+        if response.status_code == 200:
+            with open(local_tif, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"Downloaded tile {i+1}/{len(items)}: {local_tif}")
+        else:
+            print(f"Failed to download tile {i+1}/{len(items)}. Status code:", response.status_code)
+            continue
+    else:
+        print(f"{local_tif} already exists. Skipping download.")
+    
+    downloaded_files.append(local_tif)
+
+# ----------------------------------------------------------------------------
+# Step 4: Mosaic All Downloaded Tiles
+# ----------------------------------------------------------------------------
+src_files_to_mosaic = []
+for tif in downloaded_files:
+    src = rasterio.open(tif)
+    src_files_to_mosaic.append(src)
+
+mosaic, mosaic_transform = merge(src_files_to_mosaic)
+
+# Handle the dimensionality issue
+if mosaic.ndim == 4:
+    mosaic = mosaic.squeeze()
+
+# Ensure we have a 3D array (bands, height, width)
+if mosaic.ndim == 2:
+    mosaic = mosaic[np.newaxis, :, :]
+
+mosaic_tif = os.path.join(OUTPUT_DIR, "punjab_worldcover_mosaic.tif")
+mosaic_meta = src_files_to_mosaic[0].meta.copy()
+mosaic_meta.update({
+    "driver": "GTiff",
+    "height": mosaic.shape[1],
+    "width": mosaic.shape[2],
+    "count": 1,
+    "transform": mosaic_transform,
+    "dtype": mosaic.dtype
+})
+
+with rasterio.open(mosaic_tif, "w", **mosaic_meta) as dst:
+    dst.write(mosaic[0], 1)
+
+for src in src_files_to_mosaic:
+    src.close()
+
+print("Created mosaic:", mosaic_tif)
+
+# ----------------------------------------------------------------------------
+# Step 5: Crop the Mosaic to Punjab
+# ----------------------------------------------------------------------------
+with rasterio.open(mosaic_tif) as src:
+    mosaic_crs = src.crs
+
+if punjab_gdf.crs != mosaic_crs:
+    punjab_gdf = punjab_gdf.to_crs(mosaic_crs)
+    print("Reprojected Punjab shapefile to mosaic's CRS.")
+
+geoms = [feature.__geo_interface__ for feature in punjab_gdf.geometry]
+
+cropped_tif = os.path.join(OUTPUT_DIR, "punjab_landcover.tif")
+with rasterio.open(mosaic_tif) as src:
+    out_image, out_transform = mask(src, geoms, crop=True)
+    out_meta = src.meta.copy()
+
+out_meta.update({
+    "driver": "GTiff",
+    "height": out_image.shape[1],
+    "width": out_image.shape[2],
+    "transform": out_transform
+})
+
+with rasterio.open(cropped_tif, "w", **out_meta) as dest:
+    dest.write(out_image)
+
+print("Cropped mosaic saved as:", cropped_tif)
+
+# ----------------------------------------------------------------------------
+# Step 6: Fetch and Clean Original Colors
+# ----------------------------------------------------------------------------
+first_item = planetary_computer.sign(items[0])
+classification_classes = first_item.to_dict()['assets']['map'].get('classification:classes', [])
+
+print("Classification classes from STAC item:")
+print(classification_classes)
+
+class_info = {}
+for cls in classification_classes:
+    value = cls['value']
+    label = cls['description']
+    color = cls['color_hint']
+    if not color.startswith('#'):
+        color = '#' + color
+    class_info[value] = {'label': label, 'color': color}
+
+print("Processed class info:")
+print(class_info)
+
+# ----------------------------------------------------------------------------
+# Step 7: Obtain and Resample DEM Data
+# ----------------------------------------------------------------------------
+os.environ["PROJ_LIB"] = r"C:\Users\irfan\Anaconda3\Library\share\proj"
+
+minx, miny, maxx, maxy = punjab_bounds
+print("Creating DEM grid from bounds:", punjab_bounds)
+
+step = 0.005
+
+lon_vals = np.arange(minx, maxx, step)
+lat_vals = np.arange(maxy, miny, -step)
+print(f"Grid dimensions: {len(lat_vals)} rows x {len(lon_vals)} cols")
+
+dem_array = np.empty((len(lat_vals), len(lon_vals)), dtype=np.float32)
+dem_data = srtm.get_data()
+
+for i, lat in enumerate(lat_vals):
+    for j, lon in enumerate(lon_vals):
+        elevation = dem_data.get_elevation(lat, lon)
+        if elevation is None:
+            elevation = np.nan
+        dem_array[i, j] = elevation
+
+transform = from_origin(minx, max(lat_vals), step, step)
+dem_tif = os.path.join(OUTPUT_DIR, "punjab_dem.tif")
+
+with rasterio.open(
+    dem_tif, "w",
+    driver="GTiff",
+    height=dem_array.shape[0],
+    width=dem_array.shape[1],
+    count=1,
+    dtype=dem_array.dtype,
+    crs="EPSG:4326",
+    transform=transform,
+) as dst:
+    dst.write(dem_array, 1)
+
+print("DEM raster saved as:", dem_tif)
+
+# ----------------------------------------------------------------------------
+# Step 8: Resample Land Cover to DEM Resolution
+# ----------------------------------------------------------------------------
+with rasterio.open(cropped_tif) as src:
+    landcover_data = src.read(1)
+    src_transform = src.transform
+    src_crs = src.crs
+
+with rasterio.open(dem_tif) as dem_src:
+    dem_transform = dem_src.transform
+    dem_crs = dem_src.crs
+    dem_shape = (dem_src.height, dem_src.width)
+
+resampled_landcover = np.empty(dem_shape, dtype=landcover_data.dtype)
+
+reproject(
+    source=landcover_data,
+    destination=resampled_landcover,
+    src_transform=src_transform,
+    src_crs=src_crs,
+    dst_transform=dem_transform,
+    dst_crs=dem_crs,
+    resampling=Resampling.nearest
+)
+
+resampled_tif = os.path.join(OUTPUT_DIR, "punjab_landcover_resampled.tif")
+with rasterio.open(
+    resampled_tif, "w",
+    driver="GTiff",
+    height=dem_shape[0],
+    width=dem_shape[1],
+    count=1,
+    dtype=resampled_landcover.dtype,
+    crs=dem_crs,
+    transform=dem_transform,
+) as dst:
+    dst.write(resampled_landcover, 1)
+
+print("Resampled land cover raster saved as:", resampled_tif)
+
+# ----------------------------------------------------------------------------
+# Step 9: Generate the Land Cover Map
+# ----------------------------------------------------------------------------
+import matplotlib.colors as mcolors
+
+with rasterio.open(resampled_tif) as src:
+    landcover_array = src.read(1)
+    extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
+    nodata_val = src.nodata  # If no-data is set, we can mask it.
+
+# (1) Mask out no-data if needed
+if nodata_val is not None:
+    landcover_array = np.ma.masked_where(landcover_array == nodata_val, landcover_array)
+
+# (2) Build a colormap from class_info
+landcover_keys = sorted(class_info.keys())
+landcover_colors = [class_info[k]['color'] for k in landcover_keys]
+cmap = mcolors.ListedColormap(landcover_colors)
+# Add a boundary above your largest key so it bins properly
+norm = mcolors.BoundaryNorm(landcover_keys + [max(landcover_keys) + 10], cmap.N)
+
+# Create the figure and axes
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Set the background to white (or transparent)
+ax.set_facecolor("white")
+fig.patch.set_facecolor("white")
+
+# Plot the raster
+im = ax.imshow(
+    landcover_array,
+    cmap=cmap,
+    norm=norm,
+    extent=extent,
+    origin='upper'
+)
+
+# Optionally plot the Punjab boundary on top (uncomment if desired):
+# punjab_gdf.boundary.plot(ax=ax, color='black', linewidth=0.7)
+
+# Title and labels
+ax.set_title("Land Cover - Punjab, Pakistan", fontsize=14, pad=15)
+ax.set_xlabel("Longitude", fontsize=12)
+ax.set_ylabel("Latitude", fontsize=12)
+
+# Customize the colorbar
+cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04, ticks=landcover_keys)
+cbar.ax.set_yticklabels([class_info[k]['label'] for k in landcover_keys])
+cbar.set_label("Land Cover Classes", rotation=270, labelpad=15, fontsize=12)
+
+# Save the figure
+output_png = os.path.join(OUTPUT_DIR, "Punjab_landcover.png")
+plt.savefig(output_png, dpi=300, bbox_inches="tight", facecolor="white")
+# If you want a fully transparent background:
+# plt.savefig(output_png, dpi=300, bbox_inches="tight", transparent=True)
+
+plt.show()
+
+print("land cover map saved as:", output_png)
